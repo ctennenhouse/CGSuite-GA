@@ -1,0 +1,525 @@
+// Genetic Algorithm for search for high temperature (fitness==temp) positions
+//  in Partizan Arc Kayles (PAK)
+
+/* craig tennenhouse, Feb 27, 2023
+ *	last modified May 8, 2023
+ * Using a GA to find higher temperature position in partizan arc kayles.
+ * Uses an upper triangular matrix in a grid
+ * All positions are trees
+ * Chromosomes are lists: [fitness,temp,game position]
+*/
+
+
+seed := 14093;
+smallestGraph := 20;
+largestGraph := 30;
+popSize := 15; 					// initial population size
+tournSize := 4;
+selectionMethod := 2;			// 1 for deterministic tournament
+								// 2 for roulette wheel
+numGens := 20;					// number of generations
+verbose := 1; 					// 1 for best fit each gen, 0 for only if improvement
+elites := 2; 					// number of best fit to maintain next gen
+immigrants := 1;				// number of random immigrants each gen
+mutProb := 1/64;				// mutation probability
+PAK := examples.PAKupperTri;	// partizan arc kayles
+genCount := 0;					// generation count
+pop := [];						// starting population
+cont := 0; 						// continue evolving, sets to 1 on first run
+edgeProb := 1/4;				// for generating initial population
+bestCh := Grid.Empty(0,0);		// for final reporting
+smallestBestCh := Grid.Empty(0,0);
+bestFitness := -1;
+collectFitness := 5/2;
+collection := [];				// collect positions with temperature collectTemp
+absoluteZero := -100;			// lower than any possible fitness value
+mutateElites := 1;				// whether to add mutated, non-crossed-over elites to next gen
+meteorProb := 0;				// probability that at each gen an asteroid destroys most chromosomes
+								// currently unused
+
+DCgrid := Grid.Empty(14,14);	// Drummond-Cole game with temp 2
+Blues := [(1,3),(2,5),(4,6),(5,7),(6,10),(7,11),(8,12),(12,13)];
+Reds :=  [(3,4),(4,5),(6,7),(7,8),(8,9),(10,11),(11,12),(13,14)];
+DCgrid := DCgrid.Updated({coord => 1 for coord in Blues});
+DCgrid := DCgrid.Updated({coord => 2 for coord in Reds});
+
+// position with temp 9/4
+ninefourths := PAK(".l........r.....|..r.l...........|...r..l.r.......|.....l..........|.........r......|................|.......r........|...........l..l.|.............l..|................|................|............r...|................|................|...............r|................").grid;
+// position with temp 5/2
+fivehalves := PAK(".r...................|..l..................|...l...r.............|....r................|.....................|......l..............|.......r.............|........r.l..........|.........l...........|.....................|.............r.......|............r........|.............l.......|..............l...l..|...............r.....|.....................|.................l...|..................r..|...................r.|....................l|.....................").grid;
+
+
+// generate random number between 0 and 1
+def random() := begin
+	var next := 0;
+	var MULTIPLIER := 6293;
+	var INCREMENT := 997;
+	var MODULUS := 163848;
+	var DYADICMOD := 16384;
+	next := (MULTIPLIER * seed + INCREMENT)%MODULUS;
+	seed := next;
+	newMod := next%DYADICMOD; // make dyadic
+	var result := newMod / DYADICMOD;
+	result
+	end;
+// need to keep track of result and plug in as seed for next iteration
+// hate to use 'seed' as global variable but it might be easiest
+
+
+// convert dyadic to integer (round down)
+def toInt(r as Game) := begin
+	var newInt := r;
+	if not r.IsInteger then
+		newInt := {r-1|r};
+	end
+	newInt
+end;
+
+
+// generate random integer between a (inclusive) and b (non-inclusive)
+def randomInt(a as Integer, b as Integer) := begin
+	var rand := random();
+	var newInt := toInt(rand*(b-a));
+	var outInt := newInt + a;
+	outInt
+end;
+
+
+// generate a random population of trees
+// graph is an upper triangular matrix of 0, 1, 2, one stone in each column
+def popGen(popSize as Integer, graphMin as Integer, graphMax as Integer) := begin
+	var popList := [];
+	var randOder := 0;
+	var chromosome := [];
+	for k from 1 to popSize do
+		randOrder := randomInt(graphMin, graphMax+1);
+		chromosome := Grid.Empty(randOrder,randOrder);
+		chromosome := chromosome.Updated({(randomInt(1,i+1),i+1) => randomInt(1,3) for i from 1 to randOrder-1});
+		// initiate each member with negative fitness
+		popList := popList.Adjoin([absoluteZero,absoluteZero,chromosome]);
+	end
+	popList
+end;
+
+
+// mutate chromosome
+// return single chromosome
+// mutProb is dyadic rational
+def mutate(inGrid as Grid, mutProb as Game) := begin
+	var newGrid := inGrid;
+	var n := inGrid.ColCount;
+	var r := 0;
+	randint := 0;
+	var toremove := 0;
+	var pos := 0;
+	var tempL := [];
+	var currentOrder := 0;
+	var k := 0;
+	// move edges
+	for Col from 2 to inGrid.ColCount do
+		r := random();
+		if (r < mutProb) then // move stone to different row
+			rowPos := 1;
+			for Row from 1 to inGrid.RowCount do
+				if inGrid[(Row,Col)]>0 then
+					rowPos := Row;
+				end;
+			end;
+			newRow := randomInt(1,Col);
+			newGrid := newGrid.Updated({(rowPos,Col) => 0, (newRow,Col) => randomInt(1,3)});
+		end;
+	end;
+				
+	/*
+	for Row from 1 to inGrid.RowCount for Col from 1 to inGrid.ColCount do
+		if inGrid[(Row,Col)]>0 then
+			r := random();
+			if (r < mutProb) then
+				newGrid := newGrid.Updated({(Row,Col) => 0, (randomInt(1,inGrid.RowCount),Col) => randomInt(1,3)});
+			end;
+		end;
+	end;
+	*/
+
+	// randomly remove a vertex or add a vertex and one edge
+	r := random();
+	// don't let the graph be too small
+	if (r < mutProb) and (n>smallestGraph) then
+		x := randomInt(1,n+1);
+		newGrid := removeRowCol(newGrid, x);
+		n := n-1;
+	end
+	r := random();
+	// don't let the graph get too big
+	if (r < mutProb) and (n<largestGraph) then
+		largerGrid := Grid.Empty(n+1,n+1);
+		largerGrid := largerGrid.Updated({(i,j) => newGrid[(i,j)] for i from 1 to n-1 for j from i+1 to n});
+		// add new column
+		largerGrid := largerGrid.Updated({(randomInt(1,n+1),n+1) => randomInt(1,3)});
+		newGrid := largerGrid;
+		n := n+1;
+	end	
+	newGrid // return mutated grid
+end;
+
+
+// crossover chromosomes
+// trade uper left squares
+// return list of two new chromosomes
+def crossover_onePoint(aGrid as Grid, bGrid as Grid) := begin
+	var min := 0;
+	var pt := 0;
+	var newAgrid := aGrid;
+	var newBgrid := bGrid;
+	var newPair := [];
+
+	// choose crossover point
+	minDim := Min([aGrid.RowCount,aGrid.ColCount,bGrid.RowCount,bGrid.ColCount]);
+	if minDim > 5 then
+		pt := randomInt(2,minDim-1);
+		// crossover at pt
+		newAgrid := newAgrid.Updated({(i,j) => bGrid[(i,j)] for i from 1 to pt-1 for j from i+1 to pt});
+		newBgrid := newBgrid.Updated({(i,j) => aGrid[(i,j)] for i from 1 to pt-1 for j from i+1 to pt});
+	end
+	newPair := [newAgrid,newBgrid];
+	newPair
+end;
+
+
+// calculate fitness of population
+// returns a list of 2 element lists: [temp,game]
+// Note: order matters so sort is correct
+def popFitness(pop as List) := begin
+	var dict := []; //set empty association list
+	gameTemp := 0;
+	counter := 1;
+	changed := 0;
+	for dictMember in pop do
+		gameFitness := dictMember[1];
+		gameTemp := dictMember[2];
+		ch := dictMember[3];
+		// find fitness of new chromosomes
+		if gameFitness==absoluteZero then
+			testCh := ch;
+			gameTemp := PAK(ch).CanonicalForm.Temperature; 
+			gameFitness := gameTemp; // fitness is just the temp
+			// increase fitness slightly if chromosome is short
+			gameFitness := gameFitness + 1/2^ch.RowCount;
+			if gameFitness > bestFitness then
+				bestFitness := gameFitness;
+				smallestBestCh := ch;
+				changed := 1;
+			end;
+			if (gameFitness >= collectFitness) and (not collection.Contains(ch)) then
+				collection := collection.Adjoin(ch);
+				System.Print(ch.ToString(".lre"));
+			end;
+			if (gameFitness >= bestFitness) and (ch.ColCount < smallestBestCh.ColCount) then
+				smallestBestCh := ch;
+			end;
+		end
+		dict := dict.Adjoin([gameFitness,gameTemp,ch]);
+		//fitnessStr := gameFitness.Floor.ToString + "+" + (gameFitness-gameFitness.Floor).ToString;
+		gameTempStr := gameTemp.ToString;
+		if verbose>1 then
+			System.Print("    " + genCount.ToOutput + "." + counter.ToOutput + " Temp:" + gameTempStr + " Size:" + ch.RowCount.ToOutput);
+		end;
+		if verbose>0 then			
+			if (changed>0) then
+				System.Print("Temp " + gameTempStr + ", Size " + ch.RowCount.ToOutput + ":");
+				System.Print(ch.ToString(".lre").ToOutput);				
+				changed := 0;
+			end;
+		end
+		counter := counter +1;		
+	end
+	dict
+end;
+
+
+// choose two pop members for crossover using Deterministic Tournament Selection
+//  i.e. chooses most fit in each tournament, with replacement
+// returns list of two lists (chromosomes)
+def tournamentSelection(k as Integer, dict as List) := begin
+	var n := dict.Length; // pop size
+	var pairToCross := [];
+	for i from 1 to 2 do
+		var tourn := [dict[randomInt(1,n)] for j from 1 to k];
+		// sort tournament
+		tourn := tourn.Sorted;
+		// choose winner - kth element has highest fitness
+		pairToCross := pairToCross.Adjoin(tourn[k][3]);
+	end
+	pairToCross
+end;
+
+// choose two pop members for crossover using Biased Random Selection
+// i.e. Roulette Wheel Selection with proportions based on fitness
+// Note: Choose indices, not literal chromosomes, since we choose distinct
+//		 values and don't want to get stuck in a loop if all chrom's are equal
+def rouletteSelection(dict as List) := begin
+	var n := dict.Length;
+	var totalFitness := [member[1] for member in dict].Sum;
+
+	// choose first parent
+	var r := random();
+	var parentOneIndex := n; // assume last member
+	var foundParent := 0;
+	var chromIndex := 1;
+	var cumFitness := 0; // cumulative normalized fitness
+	while (foundParent<1 and chromIndex<n) do
+		currentFitness := dict[chromIndex][1];
+		cumFitness := cumFitness + currentFitness/totalFitness; 
+		if r<cumFitness then
+			parentOneIndex := chromIndex;
+			foundParent := 1;
+		end;
+		chromIndex := chromIndex + 1;
+	end;
+	// choose next parent distinct from first
+	var parentTwoIndex := parentOneIndex;
+	while (parentTwoIndex==parentOneIndex) do
+		r := random();
+		foundParent := 0;
+		chromIndex := 1;
+		cumFitness := 0;
+		while (foundParent<1 and chromIndex<=n) do
+			currentFitness := dict[chromIndex][1];
+			cumFitness := cumFitness + currentFitness/totalFitness; 
+			if r<cumFitness then
+				parentTwoIndex := chromIndex;
+				foundParent := 1;
+			end;
+			chromIndex := chromIndex + 1;
+		end;
+	end;	
+	[dict[parentOneIndex][3],dict[parentTwoIndex][3]]
+end;
+
+
+/////////////////////////////////////////
+// wrapper function
+// if verbose==1 show best fit each gen
+// if cont==0 then reset the population and gen count
+def GeneticAlgorithm() := begin
+	// initiate population if not continuing
+	if cont==0 then
+		genCount := 0;	
+		pop := [];	
+	end
+	pop := pop.Concat(popGen(popSize-pop.Length, smallestGraph, largestGraph));
+	if (verbose>0) then
+		System.Print("Population " + pop.Length.ToOutput);
+	end	
+	cont := 1;
+	var nextPop := [];
+	//var dict := [];
+	var pair := [];
+	var crossedPair := [];
+	var mutatedPair := [];
+	var best_fitness := 0; // keep track of most fit
+	var best_temp := 0;
+	var best_fit_ch := [];
+	var top_dog := [];
+	var print_out := 0;
+	
+	for i from 1 to numGens do
+		genCount := genCount + 1;
+		// get pop fitness
+		pop := popFitness(pop);
+		if (elites > 0) or (verbose >0) then
+			pop := pop.Sorted; // sort by fitness
+			top_dog := pop[pop.Length];
+			print_out := 0;
+			if top_dog[1] > best_fitness then
+				print_out := 1;
+				best_fitness := top_dog[1];
+				best_temp := top_dog[2];
+				best_fit_ch := top_dog[3];	
+			end		
+			if (verbose>0 or print_out==1) then		
+				aveFitness := Sum([chrom[1] for chrom in pop])/pop.Length;
+				aveFitnessStr := aveFitness.Floor.ToString + "+" + (aveFitness-aveFitness.Floor).ToString;
+				bestFitness := top_dog[1];
+				bestFitnessStr := bestFitness.Floor.ToString + "+" + (bestFitness-bestFitness.Floor).ToString;				
+				System.Print("Gen "+genCount.ToOutput+", highest fitness "+top_dog[1].ToOutput+", ave fitness "+aveFitnessStr+", highest temp "+top_dog[2].ToString+", size "+top_dog[3].ColCount.ToString);
+				System.Print("  " + top_dog[3].ToString(".lre").ToOutput);
+				System.Print("");
+			end
+			// add elites to next gen
+			nextPop := nextPop.Concat([pop[j] for j from pop.Length-elites+1 to pop.Length]);
+			// add random immigrants
+			nextPop := nextPop.Concat(popGen(immigrants, smallestGraph, largestGraph));
+			if mutateElites>0 then
+				nextPop := nextPop.Concat([[absoluteZero,absoluteZero,mutate(pop[j][3],mutProb)] for j from pop.Length-elites+1 to pop.Length]);
+			end
+			
+		end
+		// select pairs, crossover, and mutate
+		while nextPop.Length < popSize do
+			if selectionMethod==1 then
+				pair := tournamentSelection(tournSize, pop);
+			else
+				pair := rouletteSelection(pop);
+			end;
+			crossedPair := crossover_onePoint(pair[1], pair[2]);
+			mutatedPair := [mutate(crossedPair[1], mutProb),mutate(crossedPair[2], mutProb)];
+			for ch in mutatedPair do
+				if (not nextPop.Contains([absoluteZero,absoluteZero,ch])) then // don't duplicate chromosomes
+					nextPop := nextPop.Adjoin([absoluteZero,absoluteZero,ch]);
+				end
+			end
+		end
+		pop := nextPop;
+		nextPop := [];
+	end
+	
+	// print parameters
+	System.Print("");
+	System.Print("smallestGraph " + smallestGraph.ToOutput);
+	System.Print("largestGraph " + largestGraph.ToOutput);
+	System.Print("popSize " + popSize.ToOutput);
+	System.Print("tournSize " + tournSize.ToOutput);
+	System.Print("elites " + elites.ToOutput);
+	System.Print("mutProb " + mutProb.ToOutput);
+	System.Print("edgeProb " + edgeProb.ToOutput);
+	
+	// return highest fit chromosome with fitness
+	//dict := dict.Sorted;
+	//bestCh := dict[dict.Length][2];
+	//System.Print(bestCh.ToString(".lre"));
+	//dict[dict.Length]
+	System.Print(smallestBestCh.ToString(".lre"));
+	// sort so most fit members are last
+	pop := pop.Sorted;
+	smallestBestCh
+end;
+/////////////////////////////////////////
+
+
+// delete list element at position 'pos'
+def delAt(L as List, pos as Integer) := begin
+    newL := [L[i] for i from 1 to pos-1].Concat([L[i] for i from pos+1 to L.Length]);
+    newL
+end;
+
+
+// replace list element at pos 'pos'
+def replaceAt(L as List, pos as Integer, val) := begin
+	newL := [L[i] for i from 1 to pos-1].Adjoin(val).Concat([L[i] for i from pos+1 to L.Length]);
+	newL
+end;
+
+
+// just generate a random symmetric grid
+def randomPos(order as Integer) := begin
+	L := ["." for k from 1 to order^2];
+	for uvx from 0 to order-2 do
+		for vvx from uvx+1 to order-1 do
+			weight := randomInt(0,3);
+			if weight==0 then
+				weight_char := ".";
+			elseif weight==1 then
+				weight_char := "l";
+			else
+				weight_char := "r";
+			end
+			pos := uvx*order + vvx + 1;
+			L := [L[i] for i from 1 to pos-1].Adjoin(weight_char).Concat([L[i] for i from pos+1 to order^2]);
+			pos := vvx*order + uvx + 1;
+			L := [L[i] for i from 1 to pos-1].Adjoin(weight_char).Concat([L[i] for i from pos+1 to order^2]);
+		end
+	end
+	s := "";
+	for u from 0 to order-1 do
+		s := s + Sum([L[k] for k from u*order+1 to (u+1)*order]) + "|";
+	end
+	s
+end;
+
+
+// Generate a bunch of random positions and check their temp
+def testBoards(num as Integer) := begin
+	best := [0,""];
+	lowN := 15;
+	highN := 20;
+	for i from 1 to num do
+		n := randomInt(lowN, highN+1);
+		ch := randomPos(n);
+		T := G(ch).CanonicalForm.Temperature;
+		if T > best[1] then
+			System.Print(i.ToOutput + " " + ch.ToOutput + " " + T.ToOutput);
+			best := [T,ch];
+		end
+	end
+	System.Print("Checked " + num.ToOutput + " random positions")
+end;
+
+
+// remove rows and columns that are all zeroes
+def removeZeroes(grid as Grid) := begin
+	x := 1;
+	finalGrid := grid;
+	while x<= grid.RowCount do // look at each row for all zeros
+		if Sum([grid[(x,y)] for y from 1 to grid.ColCount])==0 then
+			//System.Print(grid.ToOutput);
+			//System.Print("Found 0 row at x=" + x.ToOutput);        
+			finalGrid := Grid.Empty(grid.RowCount-1,grid.ColCount);
+			finalGrid := finalGrid.Updated({(i,j) => grid[(i,j)] for i from 1 to x-1 for j from 1 to grid.ColCount});        
+			//System.Print(finalGrid.ToOutput);
+			finalGrid := finalGrid.Updated({(i,j) => grid[(i+1,j)] for i from x to grid.RowCount-1 for j from 1 to grid.ColCount});
+			//System.Print(finalGrid.ToOutput);
+			grid := finalGrid;
+		else
+			x := x+1;
+		end
+	end
+
+	y := 1;
+	while y<= grid.ColCount do // look at each col for all zeros
+		if Sum([grid[(x,y)] for x from 1 to grid.RowCount])==0 then
+			//System.Print(grid.ToOutput);
+			//System.Print("Found 0 col at y=" + y.ToOutput);        
+			finalGrid := Grid.Empty(grid.RowCount,grid.ColCount-1);
+			finalGrid := finalGrid.Updated({(i,j) => grid[(i,j)] for i from 1 to grid.RowCount for j from 1 to y-1});        
+			//System.Print(finalGrid.ToOutput);
+			finalGrid := finalGrid.Updated({(i,j) => grid[(i,j+1)] for i from 1 to grid.RowCount for j from y to grid.ColCount-1});
+			//System.Print(finalGrid.ToOutput);
+			grid := finalGrid;
+		else
+			y := y+1;
+		end
+	end
+	finalGrid
+end;
+
+
+// remove row x and column x
+def removeRowCol(grid as Grid, x as Integer) := begin
+	// remove row x
+	newGrid := Grid.Empty(grid.RowCount-1,grid.ColCount);
+	newGrid := newGrid.Updated({(i,j) => grid[(i,j)] for i from 1 to x-1 for j from 1 to grid.ColCount});
+	newGrid := newGrid.Updated({(i,j) => grid[(i+1,j)] for i from x to grid.RowCount-1 for j from 1 to grid.ColCount});
+	grid := newGrid;
+	
+	// remove col x
+	newGrid := Grid.Empty(grid.RowCount,grid.ColCount-1);
+	newGrid := newGrid.Updated({(i,j) => grid[(i,j)] for i from 1 to grid.RowCount for j from 1 to x-1});
+	newGrid := newGrid.Updated({(i,j) => grid[(i,j+1)] for i from 1 to grid.RowCount for j from x to grid.ColCount-1});
+	grid := newGrid;
+	grid	
+end; 
+
+
+// eliminate isolated vertices
+def removeIsolates(inGrid as Grid) := begin
+	var x := 1;
+	while x <= Min([inGrid.RowCount, inGrid.ColCount]) do
+		if Sum([inGrid[(x,i)] for i from 1 to inGrid.ColCount])+Sum([inGrid[(i,x)] for i from 1 to inGrid.RowCount]) == 0 then
+			inGrid := removeRowCol(inGrid, x);
+		else
+			x := x+1;
+		end
+	end
+	inGrid
+end;
